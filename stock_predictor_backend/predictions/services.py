@@ -1,241 +1,184 @@
-# stock_predictor_backend/predictions/services.py
-import os
-import pickle
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 import yfinance as yf
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.linear_model import LinearRegression
 from prophet import Prophet
-from .models import StockPrediction
+import joblib
+import os
 
 class PredictionService:
+    """Service for stock price predictions using various ML models"""
+    
     def __init__(self):
         self.models_path = os.path.join(os.path.dirname(__file__), 'ml_models')
-        # Ensure the model directory exists
         os.makedirs(self.models_path, exist_ok=True)
-    
-    def get_stock_data(self, ticker, period='2y'):
-        """Fetch historical stock data from Yahoo Finance."""
+        
+    def get_stock_data(self, ticker, period='1y'):
+        """Fetch historical stock data using yfinance"""
         try:
-            # Get stock data
             stock = yf.Ticker(ticker)
             df = stock.history(period=period)
-            
-            # Reset index to have date as a column
-            df = df.reset_index()
-            
-            # Format date and select required columns
-            df['Date'] = pd.to_datetime(df['Date'])
-            df = df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
-            
             return df
         except Exception as e:
-            print(f"Error fetching data for {ticker}: {e}")
+            print(f"Error fetching data for {ticker}: {str(e)}")
             return None
     
-    def prepare_data_for_lstm(self, df, feature='Close', look_back=60):
-        """Prepare data for LSTM model."""
-        # Select the feature to predict
-        data = df[feature].values.reshape(-1, 1)
+    def prepare_data_for_linear_model(self, df):
+        """Prepare data for linear regression model"""
+        if df is None or df.empty:
+            return None, None
         
-        # Normalize the data
-        scaler = MinMaxScaler(feature_range=(0, 1))
-        scaled_data = scaler.fit_transform(data)
+        # Create features
+        df['Date'] = df.index
+        df['Day'] = df['Date'].dt.day
+        df['Month'] = df['Date'].dt.month
+        df['Year'] = df['Date'].dt.year
+        df['DayOfWeek'] = df['Date'].dt.dayofweek
         
-        # Create dataset with lookback window
-        X = []
-        y = []
+        # Use last 30 days for prediction
+        df_train = df[:-30].copy()
+        df_test = df[-30:].copy()
         
-        for i in range(look_back, len(scaled_data)):
-            X.append(scaled_data[i-look_back:i, 0])
-            y.append(scaled_data[i, 0])
+        # Select features and target
+        features = ['Day', 'Month', 'Year', 'DayOfWeek', 'Open', 'High', 'Low', 'Volume']
+        X_train = df_train[features]
+        y_train = df_train['Close']
+        X_test = df_test[features]
         
-        X, y = np.array(X), np.array(y)
-        
-        # Reshape for LSTM [samples, time steps, features]
-        X = np.reshape(X, (X.shape[0], X.shape[1], 1))
-        
-        return X, y, scaler
+        return X_train, y_train, X_test, df_test
     
-    def train_lstm_model(self, ticker):
-        """Train LSTM model for a specific ticker."""
-        try:
-            from tensorflow.keras.models import Sequential
-            from tensorflow.keras.layers import LSTM, Dense, Dropout
-            
-            # Get historical data
-            df = self.get_stock_data(ticker)
-            if df is None:
-                return None
-            
-            # Prepare data
-            X, y, scaler = self.prepare_data_for_lstm(df)
-            
-            # Split data into train and test sets
-            train_size = int(len(X) * 0.8)
-            X_train, X_test = X[:train_size], X[train_size:]
-            y_train, y_test = y[:train_size], y[train_size:]
-            
-            # Build LSTM model
-            model = Sequential()
-            model.add(LSTM(units=50, return_sequences=True, input_shape=(X_train.shape[1], 1)))
-            model.add(Dropout(0.2))
-            model.add(LSTM(units=50, return_sequences=False))
-            model.add(Dropout(0.2))
-            model.add(Dense(units=25))
-            model.add(Dense(units=1))
-            
-            # Compile model
-            model.compile(optimizer='adam', loss='mean_squared_error')
-            
-            # Train model
-            model.fit(X_train, y_train, batch_size=32, epochs=20, validation_data=(X_test, y_test), verbose=0)
-            
-            # Save model and scaler
-            model_path = os.path.join(self.models_path, f"{ticker}_lstm_model.h5")
-            scaler_path = os.path.join(self.models_path, f"{ticker}_scaler.pkl")
-            
-            model.save(model_path)
-            with open(scaler_path, 'wb') as f:
-                pickle.dump(scaler, f)
-            
-            return model
-            
-        except Exception as e:
-            print(f"Error training LSTM model for {ticker}: {e}")
+    def linear_regression_prediction(self, ticker):
+        """Linear regression model for stock prediction"""
+        # Get data
+        df = self.get_stock_data(ticker)
+        if df is None or df.empty:
             return None
+        
+        # Prepare data
+        X_train, y_train, X_test, df_test = self.prepare_data_for_linear_model(df)
+        if X_train is None:
+            return None
+        
+        # Train model
+        model = LinearRegression()
+        model.fit(X_train, y_train)
+        
+        # Make predictions
+        predictions = model.predict(X_test)
+        
+        # Save predictions
+        result_df = df_test.copy()
+        result_df['Predicted_Close'] = predictions
+        
+        # Save the model
+        model_path = os.path.join(self.models_path, f"{ticker}_linear.joblib")
+        joblib.dump(model, model_path)
+        
+        return {
+            'ticker': ticker,
+            'last_close': float(df['Close'].iloc[-1]),
+            'dates': result_df.index.strftime('%Y-%m-%d').tolist(),
+            'actual': result_df['Close'].tolist(),
+            'predicted': result_df['Predicted_Close'].tolist(),
+            'model_type': 'linear_regression'
+        }
     
-    def predict_with_lstm(self, ticker, days=30):
-        """Make predictions using LSTM model."""
-        try:
-            from tensorflow.keras.models import load_model
-            
-            model_path = os.path.join(self.models_path, f"{ticker}_lstm_model.h5")
-            scaler_path = os.path.join(self.models_path, f"{ticker}_scaler.pkl")
-            
-            # Check if model exists, if not train it
-            if not os.path.exists(model_path) or not os.path.exists(scaler_path):
-                print(f"Training new model for {ticker}")
-                model = self.train_lstm_model(ticker)
-                if model is None:
-                    return None
-            else:
-                # Load model and scaler
-                model = load_model(model_path)
-                with open(scaler_path, 'rb') as f:
-                    scaler = pickle.load(f)
-            
-            # Get most recent data for prediction
-            df = self.get_stock_data(ticker, period='70d')  # Get enough days for lookback
-            if df is None:
+    def prophet_prediction(self, ticker, days_to_predict=30):
+        """Prophet model for stock prediction"""
+        # Get data
+        df = self.get_stock_data(ticker)
+        if df is None or df.empty:
+            return None
+        
+        # Prepare data for Prophet
+        prophet_df = df.reset_index()[['Date', 'Close']].rename(columns={'Date': 'ds', 'Close': 'y'})
+        
+        # Train model
+        model = Prophet(daily_seasonality=True)
+        model.fit(prophet_df)
+        
+        # Create future dataframe
+        future = model.make_future_dataframe(periods=days_to_predict)
+        forecast = model.predict(future)
+        
+        # Save the model
+        model_path = os.path.join(self.models_path, f"{ticker}_prophet.joblib")
+        model.serialize_model(model_path)
+        
+        # Get historical and predicted data
+        historical = prophet_df.merge(
+            forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']], 
+            on='ds', how='left'
+        )
+        
+        future_predictions = forecast[forecast['ds'] > prophet_df['ds'].max()]
+        
+        return {
+            'ticker': ticker,
+            'last_close': float(df['Close'].iloc[-1]),
+            'historical_dates': historical['ds'].dt.strftime('%Y-%m-%d').tolist(),
+            'historical_actual': historical['y'].tolist(),
+            'historical_predicted': historical['yhat'].tolist(),
+            'future_dates': future_predictions['ds'].dt.strftime('%Y-%m-%d').tolist(),
+            'future_predicted': future_predictions['yhat'].tolist(),
+            'future_lower': future_predictions['yhat_lower'].tolist(),
+            'future_upper': future_predictions['yhat_upper'].tolist(),
+            'model_type': 'prophet'
+        }
+    
+    def get_prediction(self, ticker, model_type='prophet'):
+        """Get prediction based on model type"""
+        if model_type == 'linear':
+            return self.linear_regression_prediction(ticker)
+        elif model_type == 'prophet':
+            return self.prophet_prediction(ticker)
+        else:
+            raise ValueError(f"Unsupported model type: {model_type}")
+    
+    def get_model_performance(self, ticker, model_type='prophet'):
+        """Calculate model performance metrics"""
+        if model_type == 'linear':
+            prediction_data = self.linear_regression_prediction(ticker)
+            if prediction_data is None:
                 return None
-            
-            # Prepare data
-            data = df['Close'].values.reshape(-1, 1)
-            scaled_data = scaler.transform(data)
-            
-            # Create prediction input (most recent 60 days)
-            X_pred = []
-            X_pred.append(scaled_data[-60:, 0])
-            X_pred = np.array(X_pred)
-            X_pred = np.reshape(X_pred, (X_pred.shape[0], X_pred.shape[1], 1))
-            
-            # Make predictions
-            predictions = []
-            last_sequence = X_pred[0].reshape(1, 60, 1)
-            last_date = df['Date'].iloc[-1]
-            
-            for i in range(days):
-                # Predict next value
-                next_pred = model.predict(last_sequence)
-                predictions.append(next_pred[0, 0])
                 
-                # Update sequence for next prediction
-                last_sequence = np.append(last_sequence[:, 1:, :], next_pred.reshape(1, 1, 1), axis=1)
+            actual = prediction_data['actual']
+            predicted = prediction_data['predicted']
             
-            # Inverse transform to get actual prices
-            predictions = np.array(predictions).reshape(-1, 1)
-            predictions = scaler.inverse_transform(predictions)
-            
-            # Create DataFrame with dates and predictions
-            pred_dates = [(last_date + timedelta(days=i+1)) for i in range(days)]
-            predictions_df = pd.DataFrame({
-                'Date': pred_dates,
-                'Predicted_Close': predictions.flatten()
-            })
-            
-            # Save predictions to database
-            self._save_predictions(ticker, predictions_df)
-            
-            return predictions_df
-            
-        except Exception as e:
-            print(f"Error predicting with LSTM for {ticker}: {e}")
-            return None
-    
-    def predict_with_prophet(self, ticker, days=30):
-        """Make predictions using Facebook Prophet."""
-        try:
-            # Get historical data
-            df = self.get_stock_data(ticker)
-            if df is None:
+        elif model_type == 'prophet':
+            prediction_data = self.prophet_prediction(ticker)
+            if prediction_data is None:
                 return None
+                
+            # Use historical data for evaluation
+            actual = prediction_data['historical_actual']
+            predicted = prediction_data['historical_predicted']
             
-            # Prepare data for Prophet (requires 'ds' and 'y' columns)
-            prophet_df = df[['Date', 'Close']].rename(columns={'Date': 'ds', 'Close': 'y'})
-            
-            # Initialize and fit Prophet model
-            model = Prophet(daily_seasonality=True)
-            model.fit(prophet_df)
-            
-            # Create future dataframe for prediction
-            future = model.make_future_dataframe(periods=days)
-            forecast = model.predict(future)
-            
-            # Extract prediction for future dates
-            predictions_df = forecast[forecast['ds'] > prophet_df['ds'].max()][['ds', 'yhat', 'yhat_lower', 'yhat_upper']]
-            predictions_df = predictions_df.rename(columns={
-                'ds': 'Date', 
-                'yhat': 'Predicted_Close',
-                'yhat_lower': 'Lower_Bound',
-                'yhat_upper': 'Upper_Bound'
-            })
-            
-            # Save predictions to database
-            self._save_predictions(ticker, predictions_df)
-            
-            # Save model
-            model_path = os.path.join(self.models_path, f"{ticker}_prophet_model.pkl")
-            with open(model_path, 'wb') as f:
-                pickle.dump(model, f)
-            
-            return predictions_df
-            
-        except Exception as e:
-            print(f"Error predicting with Prophet for {ticker}: {e}")
+        else:
+            raise ValueError(f"Unsupported model type: {model_type}")
+        
+        # Filter out None values
+        valid_pairs = [(a, p) for a, p in zip(actual, predicted) if a is not None and p is not None]
+        if not valid_pairs:
             return None
-    
-    def _save_predictions(self, ticker, predictions_df):
-        """Save predictions to database."""
-        try:
-            # Delete old predictions for this ticker
-            StockPrediction.objects.filter(ticker=ticker).delete()
             
-            # Create new prediction records
-            predictions = []
-            for _, row in predictions_df.iterrows():
-                prediction = StockPrediction(
-                    ticker=ticker,
-                    date=row['Date'],
-                    predicted_price=row['Predicted_Close'],
-                    lower_bound=row.get('Lower_Bound', None),
-                    upper_bound=row.get('Upper_Bound', None)
-                )
-                predictions.append(prediction)
-            
-            # Bulk create predictions
-            StockPrediction.objects.bulk_create(predictions)
-            
-        except Exception as e:
-            print(f"Error saving predictions for {ticker}: {e}")
+        actual_valid, predicted_valid = zip(*valid_pairs)
+        
+        # Calculate metrics
+        mse = np.mean([(a - p) ** 2 for a, p in zip(actual_valid, predicted_valid)])
+        rmse = np.sqrt(mse)
+        mae = np.mean([abs(a - p) for a, p in zip(actual_valid, predicted_valid)])
+        
+        # Calculate MAPE (Mean Absolute Percentage Error)
+        mape = np.mean([abs((a - p) / a) * 100 for a, p in zip(actual_valid, predicted_valid) if a != 0])
+        
+        return {
+            'ticker': ticker,
+            'model_type': model_type,
+            'mse': mse,
+            'rmse': rmse,
+            'mae': mae,
+            'mape': mape
+        }
